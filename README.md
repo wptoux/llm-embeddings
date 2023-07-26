@@ -30,4 +30,30 @@ torchrun --nnodes 1 --nproc_per_node=$NGPU train.py \
     --model_max_length 256
 ```
 
+## 分布式CoSent Loss
+CoSent Loss是计算一个batch内的正负样本，因此，batch size的提升也可以提升一定的训练效果。但单卡可以容纳的样本量有限，通过all_gather操作，可以把多个device的样本embedding收集起来，统一计算loss。考虑到all_gather操作会阻断loss的反向传播，可以只对当前device对应的样本做反向传播。考虑到torch ddp会对所有device的梯度求平均后进行梯度更新，这种方法可以利用到batch内的所有样本来进行计算。即：
 
+```python
+def gather_tensor(t):
+    ret = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(ret, t.contiguous())
+
+    ret[dist.get_rank()] = t
+
+    return torch.cat(ret, dim=0)
+
+emb1 = get_embeddings(input_ids, attention_mask)
+emb2 = get_embeddings(input_ids_b, attention_mask_b)
+loss = cosent_loss(gather_tensor(emb1), gather_tensor(emb2), gather_tensor(labels))
+```
+
+
+## LoRA训练
+考虑到LoRA会改变模型的输出分布，额外针对layer中输出相关的层设置lora可以提高模型效果。
+
+以Bloom为例，除默认的query_key_value外，在dense，dense_h_to_4h，dense_4h_to_h等层中也加入lora，可以提升模型效果。
+
+```
+peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=16, lora_dropout=0.1,
+                         target_modules=['query_key_value', 'dense', 'dense_h_to_4h', 'dense_4h_to_h'])
+```
